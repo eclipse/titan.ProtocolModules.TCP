@@ -1,0 +1,343 @@
+/******************************************************************************
+* Copyright (c) 2010, 2014  Ericsson AB
+* All rights reserved. This program and the accompanying materials
+* are made available under the terms of the Eclipse Public License v1.0
+* which accompanies this distribution, and is available at
+* http://www.eclipse.org/legal/epl-v10.html
+*
+* Contributors:
+*  Endre Kulcsar - initial implementation and initial documentation
+******************************************************************************/
+
+module Handle_TCP_Connections
+{
+
+import from General_Types all;
+import from TCP_Types all;
+import from IP_Types all;
+
+modulepar 
+{  
+  charstring tsp_APN1_Internet_IpAddr1;
+  charstring tsp_APN1_MS_IpAddr1; 
+}  
+
+// dummy component definition     
+type component BASIC_CT
+{
+ //...
+ 
+ var ConnectionList vc_ConnectionList := {}
+ 
+ //...
+};
+
+// data needed to identify a single TCP connection
+type record Connection
+{
+ charstring   srcIpAddr,
+ integer      srcPort,
+ charstring   dstIpAddr,
+ integer      dstPort,
+ integer      tCP_SeqNo, 
+ integer      tCP_AckNo  
+}
+
+type record of Connection ConnectionList;
+
+// function which finds the  TCP connection in a ConnectionList identified by 
+// source and destination IP addresses and ports
+function f_find_connectionID
+(
+ charstring   pl_srcIpAddr,
+ integer      pl_srcPort,
+ charstring   pl_dstIpAddr,
+ integer      pl_dstPort     
+) runs on BASIC_CT return integer
+{
+  
+  for(var integer i := 0; i < sizeof(vc_ConnectionList); i := i + 1) 
+   {
+     if 
+     (        
+       pl_srcIpAddr == vc_ConnectionList[i].srcIpAddr and
+       pl_srcPort == vc_ConnectionList[i].srcPort and
+       pl_dstIpAddr == vc_ConnectionList[i].dstIpAddr and
+       pl_dstPort  == vc_ConnectionList[i].dstPort    
+     )
+     {return i}    
+   }
+ 
+   // Add new element to vc_ConnectionList
+   var integer vl_next_element := sizeof(vc_ConnectionList);
+   vc_ConnectionList[vl_next_element].srcIpAddr := pl_srcIpAddr;
+   vc_ConnectionList[vl_next_element].srcPort := pl_srcPort;
+   vc_ConnectionList[vl_next_element].dstIpAddr := pl_dstIpAddr;
+   vc_ConnectionList[vl_next_element].dstPort := pl_dstPort;
+   vc_ConnectionList[vl_next_element].tCP_SeqNo := 100;
+   vc_ConnectionList[vl_next_element].tCP_AckNo := 0;
+   
+   return vl_next_element; 
+}
+
+// function to create a TCP/IP packets carrying the payload "pl_data"
+function f_TCP_CreatePayload(
+    charstring       pl_srcIpAddr,
+    LIN2_BO_LAST     pl_srcPort, 
+    charstring       pl_dstIpAddr,
+    LIN2_BO_LAST     pl_dstPort,
+    TCP_Control_bits pl_tcpctrl,
+    octetstring      pl_data,
+    octetstring      pl_options := ''O )
+runs on BASIC_CT
+return IPv4_packet
+{
+    var integer vl_connectionID := f_find_connectionID(pl_srcIpAddr,pl_srcPort,pl_dstIpAddr,pl_dstPort)
+
+    var octetstring vl_tcp_enc;  
+    var template IPv4_packet vl_ip;
+
+    var PDU_TCP vl_tcp_packet :=
+    {
+        source_port             := pl_srcPort,
+        dest_port               := pl_dstPort,
+        sequence_number         := vc_ConnectionList[vl_connectionID].tCP_SeqNo,        //v_TCP_SeqNo 
+        acknowledgment_number    := vc_ConnectionList[vl_connectionID].tCP_AckNo,       //v_TCP_AckNo
+        data_offset             := 0, //dummy,
+        reserved                := '000000'B,
+        control_bits            := pl_tcpctrl,
+        window                  := 3000,              // should not be hardcoded
+        checksum                := '0000'O,           // calculated by f_TCP_enc
+        urgent_pointer          := 0,                 // only set it URG-bit set in options
+        options                 := pl_options,        // f_TCP_enc adds padding to 4 byte boundary if needed
+        data                    := pl_data
+    }
+
+    //log("### TCP_Functions: TCP packet to be sent: ", vl_tcp_packet);
+
+    // Calculate new SeqNo
+    // If in TCP setup/finish phase, increase SeqNo with 1
+    // If sending data, increase SeqNo with data length
+    if(pl_tcpctrl.syn == '1'B  or pl_tcpctrl.fin == '1'B )
+    {
+        vc_ConnectionList[vl_connectionID].tCP_SeqNo := vc_ConnectionList[vl_connectionID].tCP_SeqNo + 1;  //v_TCP_SeqNo
+    }
+    else
+    {
+        vc_ConnectionList[vl_connectionID].tCP_SeqNo := vc_ConnectionList[vl_connectionID].tCP_SeqNo + lengthof(pl_data); //v_TCP_SeqNo
+    }
+
+    vl_tcp_enc := f_enc_PDU_TCP(f_IPv4_addr_enc(pl_srcIpAddr),f_IPv4_addr_enc(pl_dstIpAddr),vl_tcp_packet);
+
+    vl_ip := t_IPv4_Basic(
+        f_IPv4_addr_enc(pl_srcIpAddr),
+        f_IPv4_addr_enc(pl_dstIpAddr),
+        c_ip_proto_tcp,
+        vl_tcp_enc);
+    
+    return valueof(vl_ip);
+}
+
+
+// function to verify TCP and IP headers in a received message,
+// TCP checksum is verified, SeqNo and AckNo calculated as if we are the server
+// and saved in local ConnectionList variable.
+function f_TCP_VerifyHeader(
+    charstring  pl_srcIpAddr,
+    integer     pl_srcPort,
+    charstring  pl_dstIpAddr,
+    integer     pl_dstPort,
+    TCP_Control_bits  pl_control,
+    octetstring pl_data)
+runs on BASIC_CT
+return octetstring
+{
+    var integer vl_connectionID := f_find_connectionID(pl_srcIpAddr,pl_srcPort,pl_dstIpAddr,pl_dstPort)  
+
+    var PDU_TCP    vl_tcp_pkt;
+    var octetstring   vl_tcp_enc;
+    var template integer vl_AckNo := ?;
+    var boolean vl_wait_establish := false;
+    var boolean vl_wait_terminate := false;
+    
+    // Check IP header
+    vl_tcp_enc := f_IP_VerifyHeader(pl_srcIpAddr, pl_dstIpAddr, c_ip_proto_tcp, pl_data);
+    
+    // Check TCP header    
+    if (f_TCP_verify_checksum(f_IPv4_addr_enc(pl_srcIpAddr), f_IPv4_addr_enc(pl_dstIpAddr), vl_tcp_enc)  == false )
+    {
+           log( "### f_TCP_dec: ERROR! The TCP checksum of the received TCP packet is not correct." ); 
+           setverdict( fail );
+           stop;
+    }
+    
+    vl_tcp_pkt := f_dec_PDU_TCP( vl_tcp_enc);
+    
+    // TCP Connection Establishment, SERVER
+    if (vl_tcp_pkt.control_bits.syn == '1'B)
+    {
+        vl_wait_establish := true;
+        vc_ConnectionList[vl_connectionID].tCP_AckNo := vl_tcp_pkt.sequence_number + 1;  //v_TCP_AckNo
+    }
+    else if(vl_tcp_pkt.control_bits.ack == '1'B and vl_wait_establish)
+    {
+        vl_wait_establish := false;
+    }
+    // TCP Connection Termination, SERVER
+    else if (vl_tcp_pkt.control_bits.fin == '1'B)
+    {
+        vl_wait_terminate := true;
+        vl_AckNo := vc_ConnectionList[vl_connectionID].tCP_AckNo;    // v_TCP_AckNo
+        vc_ConnectionList[vl_connectionID].tCP_AckNo := vc_ConnectionList[vl_connectionID].tCP_AckNo + 1;  // v_TCP_AckNo
+    }
+    else if (vl_tcp_pkt.control_bits.ack == '1'B and vl_wait_terminate)
+    {
+        vl_wait_terminate := false;
+    }
+    // TCP Communication
+    else
+    {
+        vl_AckNo := vc_ConnectionList[vl_connectionID].tCP_AckNo;    //v_TCP_AckNo
+        vc_ConnectionList[vl_connectionID].tCP_AckNo := vc_ConnectionList[vl_connectionID].tCP_AckNo + lengthof(vl_tcp_pkt.data); //v_TCP_AckNo
+        
+        template PDU_TCP tr_tcp := tr_TCP_Pkt(pl_srcPort, pl_dstPort, vc_ConnectionList[vl_connectionID].tCP_SeqNo, vl_AckNo, pl_control, ?); //v_TCP_SeqNo
+        var template octetstring vl_SeqNo := ?;
+        // Check SeqNo for TCP-retransmission
+        vl_SeqNo := int2oct(vc_ConnectionList[vl_connectionID].tCP_AckNo, 4);       //v_TCP_AckNo
+        if (vc_ConnectionList[vl_connectionID].tCP_AckNo == vl_tcp_pkt.sequence_number)                                   //normal packet//v_TCP_AckNo
+        {
+            vc_ConnectionList[vl_connectionID].tCP_AckNo := vc_ConnectionList[vl_connectionID].tCP_AckNo + lengthof(vl_tcp_pkt.data); //v_TCP_AckNo
+        }
+        else if(vc_ConnectionList[vl_connectionID].tCP_AckNo == vl_tcp_pkt.sequence_number + lengthof(vl_tcp_pkt.data) )   //re-transimitted packet
+        {
+            vl_SeqNo := int2oct(oct2int(valueof(vl_SeqNo)) - lengthof(vl_tcp_pkt.data), 4);
+        }
+        else
+        {
+            setverdict(fail, "### Unexpected TCP received");
+            log("### Received: " ,vl_tcp_pkt);
+            log("### Wanted  : " ,tr_tcp);
+            stop;
+        }        
+    }
+    
+    log("### f_TCP_VerifyHeader: Received ", vl_tcp_pkt);
+    setverdict(pass);
+    return vl_tcp_pkt.data;
+}
+
+
+////////////////////////////////////////////////////
+// Misc. definitions
+////////////////////////////////////////////////////
+
+// template for a general IPv4 packet
+template IPv4_packet t_IPv4_Basic
+(
+OCT4 pl_srcIpAddr,
+OCT4 pl_dstIpAddr,
+LIN1 pl_proto,
+octetstring pl_tcp_enc
+
+) :=
+{
+ header :=
+   {
+     ver :=4,
+     hlen :=0,
+     tos := 0,
+     tlen := 0,
+     id := 0,
+     res := '0'B,
+     dfrag := '0'B,
+     mfrag := '0'B,
+     foffset := 0,
+     ttl := 0,
+     proto := pl_proto,
+     cksum := 0,
+     srcaddr := pl_srcIpAddr,
+     dstaddr := pl_dstIpAddr 
+    },  
+ 
+ 
+ ext_headers := omit,
+ payload := pl_tcp_enc
+
+}
+
+
+// template for receiving a general TCP packet
+template PDU_TCP tr_TCP_Pkt(
+    integer                    pl_srcPort,
+    integer                    pl_dstPort,
+    template integer              pl_seqNo, 
+    template integer              pl_ackNo, 
+    template TCP_Control_bits  pl_control,
+    template octetstring       pl_payload) :=
+{
+    source_port             := pl_srcPort,
+    dest_port               := pl_dstPort,
+    sequence_number         := pl_seqNo,
+    acknowledgment_number    := pl_ackNo,
+    data_offset             := (5..15),
+    reserved                := '000000'B,
+    control_bits            := pl_control,
+    window                  := ?,
+    checksum                := ?,
+    urgent_pointer          := ?,
+    options                 := *,
+    data                    := ?
+}
+
+
+// function for basic matching of header in received IP packet
+function f_IP_VerifyHeader(
+    charstring   pl_srcIpAddr,
+    charstring   pl_dstIpAddr,
+    LIN1         pl_protocol,   
+    octetstring  pl_data)
+return octetstring
+{
+    var IPv4_packet vl_ip_pkt := f_IPv4_dec(pl_data);
+    template IPv4_packet tr_ip := tr_IP_Pkt(pl_srcIpAddr, pl_dstIpAddr, pl_protocol); 
+
+    if (not match(vl_ip_pkt, tr_ip))
+    {
+        setverdict(fail, "### Received IP incorrect");
+        log("### Received: ", vl_ip_pkt);
+        log("### Wanted  : ", tr_ip);
+    }
+    setverdict(pass);
+    return vl_ip_pkt.payload;
+}
+
+
+// template for receiving a general IP packet
+template IPv4_packet tr_IP_Pkt(
+    charstring  pl_srcIpAddr := tsp_APN1_Internet_IpAddr1,
+    charstring  pl_dstIpAddr := tsp_APN1_MS_IpAddr1,
+    LIN1        pl_protocol := 0) :=
+{
+    header :=
+    {
+        ver := c_ip_version_ipv4,
+        hlen := (5..15),
+        tos := ?,
+        tlen := ?,
+        id := ?,
+        res := '0'B,             //reserved, always 0
+        dfrag := ?,
+        mfrag := ?,
+        foffset := ?,
+        ttl := (0..255),         //time to live: 255 hops
+        proto := pl_protocol,    //encapsulated protocol
+        cksum := ?,
+        srcaddr := f_IPv4_addr_enc(pl_srcIpAddr),
+        dstaddr := f_IPv4_addr_enc(pl_dstIpAddr)
+    },
+    ext_headers := omit,
+    payload := ?
+} 
+
+
+} // end of file
